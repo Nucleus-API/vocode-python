@@ -69,6 +69,59 @@ class ChatGPTAgent(RespondAgent[ChatGPTAgentConfig]):
             for action_config in self.agent_config.actions
         ]
 
+    async def prequalify(
+        self,
+        human_input,
+        conversation_id: str,
+        is_interrupt: bool = False,
+    ) -> Tuple[str, bool]:
+        assert self.transcript is not None
+        if is_interrupt and self.agent_config.cut_off_response:
+            cut_off_response = self.get_cut_off_response()
+            return cut_off_response, False
+        self.logger.debug("LLM responding to human input")
+        if self.is_first_response and self.first_response:
+            self.logger.debug("First response is cached")
+            self.is_first_response = False
+            text = self.first_response
+        else:
+            chat_parameters = self.get_chat_parameters_to_prequalify()
+            chat_completion = await openai.ChatCompletion.acreate(**chat_parameters)
+            text = chat_completion.choices[0].message.content
+        self.logger.debug(f"LLM response: {text}")
+        return text, False
+
+
+    def get_chat_parameters_to_prequalify(
+        self, messages: Optional[List] = None, use_functions: bool = True
+    ):
+        assert self.transcript is not None
+        matches = self.prompt_preamble.re.search(r'FAQ_DOC_START(.*?)FAQ_DOC_END', text, re.DOTALL)
+        if matches:
+            faq = matches.group(1).strip()
+        else:
+            faq = "Not enough info"
+        messages = messages or format_openai_chat_messages_from_transcript(
+            self.transcript, "Is there enough information in these FAQs to answer the user question? Please answer as either Yes or No. FAQ:" + faq
+        )
+
+        parameters: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": self.agent_config.max_tokens,
+            "temperature": self.agent_config.temperature,
+        }
+
+        if self.agent_config.azure_params is not None:
+            parameters["engine"] = self.agent_config.azure_params.engine
+        else:
+            parameters["model"] = self.agent_config.model_name
+
+        if use_functions and self.functions:
+            parameters["functions"] = self.functions
+
+        return parameters
+    
+    
     def get_chat_parameters(
         self, messages: Optional[List] = None, use_functions: bool = True
     ):
@@ -144,36 +197,41 @@ class ChatGPTAgent(RespondAgent[ChatGPTAgentConfig]):
         assert self.transcript is not None
 
         chat_parameters = {}
-        if self.agent_config.vector_db_config:
-            try:
-                docs_with_scores = await self.vector_db.similarity_search_with_score(
-                    self.transcript.get_last_user_message()[1]
-                )
-                docs_with_scores_str = "\n\n".join(
-                    [
-                        "Document: "
-                        + doc[0].metadata["source"]
-                        + f" (Confidence: {doc[1]})\n"
-                        + doc[0].lc_kwargs["page_content"].replace(r"\n", "\n")
-                        for doc in docs_with_scores
-                    ]
-                )
-                vector_db_result = f"Found {len(docs_with_scores)} similar documents:\n{docs_with_scores_str}"
-                messages = format_openai_chat_messages_from_transcript(
-                    self.transcript, self.agent_config.prompt_preamble
-                )
-                messages.insert(
-                    -1, vector_db_result_to_openai_chat_message(vector_db_result)
-                )
-                chat_parameters = self.get_chat_parameters(messages)
-            except Exception as e:
-                self.logger.error(f"Error while hitting vector db: {e}", exc_info=True)
+        response_text, _ = self.prequalify()
+        if response_text.strip() == "Yes": 
+            if self.agent_config.vector_db_config:
+                try:
+                    docs_with_scores = await self.vector_db.similarity_search_with_score(
+                        self.transcript.get_last_user_message()[1]
+                    )
+                    docs_with_scores_str = "\n\n".join(
+                        [
+                            "Document: "
+                            + doc[0].metadata["source"]
+                            + f" (Confidence: {doc[1]})\n"
+                            + doc[0].lc_kwargs["page_content"].replace(r"\n", "\n")
+                            for doc in docs_with_scores
+                        ]
+                    )
+                    vector_db_result = f"Found {len(docs_with_scores)} similar documents:\n{docs_with_scores_str}"
+                    messages = format_openai_chat_messages_from_transcript(
+                        self.transcript, self.agent_config.prompt_preamble
+                    )
+                    messages.insert(
+                        -1, vector_db_result_to_openai_chat_message(vector_db_result)
+                    )
+                    chat_parameters = self.get_chat_parameters(messages)
+                except Exception as e:
+                    self.logger.error(f"Error while hitting vector db: {e}", exc_info=True)
+                    chat_parameters = self.get_chat_parameters()
+            else:
                 chat_parameters = self.get_chat_parameters()
+            chat_parameters["stream"] = True
+            stream = await openai.ChatCompletion.acreate(**chat_parameters)
+            async for message in collate_response_async(
+                openai_get_tokens(stream), get_functions=True
+            ):
+                yield message, True
         else:
-            chat_parameters = self.get_chat_parameters()
-        chat_parameters["stream"] = True
-        stream = await openai.ChatCompletion.acreate(**chat_parameters)
-        async for message in collate_response_async(
-            openai_get_tokens(stream), get_functions=True
-        ):
+            message = "I am sorry but I don't have enough information to answer that. Is there anything else I could help you with?"
             yield message, True

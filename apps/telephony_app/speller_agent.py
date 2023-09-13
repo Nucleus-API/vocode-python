@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, AsyncGenerator
 import typing
 from vocode.streaming.agent.chat_gpt_agent import ChatGPTAgent
 from vocode.streaming.models.agent import AgentConfig, AgentType, ChatGPTAgentConfig
@@ -15,13 +15,13 @@ class SpellerAgent(RespondAgent[SpellerAgentConfig]):
     def __init__(self, agent_config: SpellerAgentConfig):
         super().__init__(agent_config=agent_config)
 
-    async def respond(
+    async def generate_response(
         self,
         human_input,
         conversation_id: str,
         is_interrupt: bool = False,
-    ) -> Tuple[Optional[str], bool]:
-        return "".join(c + " " for c in human_input), False
+    ) -> AsyncGenerator[Tuple[str, bool], None]:
+        yield "".join(c + " " for c in human_input), True
 
 
 class SpellerAgentFactory(AgentFactory):
